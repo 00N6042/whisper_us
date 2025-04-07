@@ -85,7 +85,7 @@ class Predictor:
                                                length_penalty=length_penalty,
                                                temperature=temperature,
                                                compression_ratio_threshold=compression_ratio_threshold,
-                                               log_prob_threshold=logprob_threshold,
+                                               logprob_threshold=logprob_threshold,
                                                no_speech_threshold=no_speech_threshold,
                                                condition_on_previous_text=condition_on_previous_text,
                                                initial_prompt=initial_prompt,
