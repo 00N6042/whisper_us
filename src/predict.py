@@ -5,54 +5,53 @@ repository, with some modifications to make it work with the RP platform.
 """
 
 from concurrent.futures import ThreadPoolExecutor
-import torch
 import numpy as np
 
-from whisper.model import Whisper, ModelDimensions
-from whisper.tokenizer import LANGUAGES
-from whisper.utils import format_timestamp
+from runpod.serverless.utils import rp_cuda
 
+from faster_whisper import WhisperModel
+from faster_whisper.utils import format_timestamp
+
+import whisper
 
 class Predictor:
-    ''' A Predictor class for the Whisper model '''
+    """ A Predictor class for the Whisper model """
+
+    def __init__(self):
+        self.models = {}
+
+    def load_model(self, model_name):
+        """ Load the model from the weights folder. """
+        """
+        loaded_model = WhisperModel(
+            model_name,
+            device="cuda" if rp_cuda.is_available() else "cpu",
+            compute_type="float16" if rp_cuda.is_available() else "int8")
+        """
+        loaded_model = whisper.load_model(model_name,device="cuda" if rp_cuda.is_available() else "cpu")
+
+        return model_name, loaded_model
 
     def setup(self):
         """Load the model into memory to make running multiple predictions efficient"""
-
-        self.models = {}
-
-        def load_model(model_name):
-            '''
-            Load the model from the weights folder.
-            '''
-            try:
-                with open(f"weights/{model_name}.pt", "rb") as model_file:
-                    checkpoint = torch.load(model_file, map_location="cpu")
-                    dims = ModelDimensions(**checkpoint["dims"])
-                    model = Whisper(dims)
-                    model.load_state_dict(checkpoint["model_state_dict"])
-                    return model_name, model
-            except FileNotFoundError:
-                print(f"Model {model_name} could not be found.")
-                return None, None
-
-        model_names = ["tiny.en", "tiny", "base.en", "base", "small.en", "small", "medium.en", "medium", "large-v1", "large-v2", "large-v3", "large", "large-v3-turbo", "turbo"]
+        model_names = ["tiny"]
         with ThreadPoolExecutor() as executor:
-            for model_name, model in executor.map(load_model, model_names):
+            for model_name, model in executor.map(self.load_model, model_names):
                 if model_name is not None:
                     self.models[model_name] = model
 
     def predict(
         self,
         audio,
-        model_name="base",
-        transcription="plain text",
+        model_name="tiny",
+        transcription="plain_text",
         translate=False,
+        translation="plain_text",
         language=None,
         temperature=0,
         best_of=5,
         beam_size=5,
-        patience=None,
+        patience=1,
         length_penalty=None,
         suppress_tokens="-1",
         initial_prompt=None,
@@ -61,12 +60,14 @@ class Predictor:
         compression_ratio_threshold=2.4,
         logprob_threshold=-1.0,
         no_speech_threshold=0.6,
+        word_timestamps=False
     ):
-        """Run a single prediction on the model"""
-        print(f"Transcribe with {model_name} model")
-        model = self.models[model_name]
-        if torch.cuda.is_available():
-            model = model.to("cuda")
+        """
+        Run a single prediction on the model
+        """
+        model = self.models.get(model_name)
+        if not model:
+            raise ValueError(f"Model '{model_name}' not found.")
 
         if temperature_increment_on_fallback is not None:
             temperature = tuple(
@@ -74,41 +75,93 @@ class Predictor:
             )
         else:
             temperature = [temperature]
+        """
+        segments, info = list(model.transcribe(str(audio),
+                                               language=language,
+                                               task="transcribe",
+                                               beam_size=beam_size,
+                                               best_of=best_of,
+                                               patience=patience,
+                                               length_penalty=length_penalty,
+                                               temperature=temperature,
+                                               compression_ratio_threshold=compression_ratio_threshold,
+                                               log_prob_threshold=logprob_threshold,
+                                               no_speech_threshold=no_speech_threshold,
+                                               condition_on_previous_text=condition_on_previous_text,
+                                               initial_prompt=initial_prompt,
+                                               suppress_tokens=[-1],
+                                               word_timestamps=word_timestamps
+                                               ))
 
-        args = {
-            "language": language,
-            "best_of": best_of,
-            "beam_size": beam_size,
-            "patience": patience,
-            "length_penalty": length_penalty,
-            "suppress_tokens": suppress_tokens,
-            "initial_prompt": initial_prompt,
-            "condition_on_previous_text": condition_on_previous_text,
-            "compression_ratio_threshold": compression_ratio_threshold,
-            "logprob_threshold": logprob_threshold,
-            "no_speech_threshold": no_speech_threshold,
-        }
+        segments = list(segments)
 
-        result = model.transcribe(str(audio), temperature=temperature, **args)
-
-        if transcription == "plain text":
-            transcription = result["text"]
-        elif transcription == "srt":
-            transcription = write_srt(result["segments"])
-        else:
-            transcription = write_vtt(result["segments"])
+        transcription = format_segments(transcription, segments)
 
         if translate:
-            translation = model.transcribe(
-                str(audio), task="translate", temperature=temperature, **args
+            translation_segments, translation_info = model.transcribe(
+                str(audio),
+                task="translate",
+                temperature=temperature
             )
 
-        return {
-            "segments": result["segments"],
-            "detected_language": LANGUAGES[result["language"]],
+            translation = format_segments(translation, translation_segments)
+
+        results = {
+            "segments": serialize_segments(segments),
+            "detected_language": info.language,
             "transcription": transcription,
-            "translation": translation["text"] if translate else None,
+            "translation": translation if translate else None,
+            "device": "cuda" if rp_cuda.is_available() else "cpu",
+            "model": model_name,
         }
+
+        if word_timestamps:
+            word_timestamps = []
+            for segment in segments:
+                for word in segment.words:
+                    word_timestamps.append({
+                        "word": word.word,
+                        "start": word.start,
+                        "end": word.end,
+                    })
+            results["word_timestamps"] = word_timestamps
+        """
+        results = model.transcribe(str(audio))
+
+        return results
+
+
+def serialize_segments(transcript):
+    '''
+    Serialize the segments to be returned in the API response.
+    '''
+    return [{
+        "id": segment.id,
+        "seek": segment.seek,
+        "start": segment.start,
+        "end": segment.end,
+        "text": segment.text,
+        "tokens": segment.tokens,
+        "temperature": segment.temperature,
+        "avg_logprob": segment.avg_logprob,
+        "compression_ratio": segment.compression_ratio,
+        "no_speech_prob": segment.no_speech_prob
+    } for segment in transcript]
+
+
+def format_segments(format, segments):
+    '''
+    Format the segments to the desired format
+    '''
+
+    if format == "plain_text":
+        return " ".join([segment.text.lstrip() for segment in segments])
+    elif format == "formatted_text":
+        return "\n".join([segment.text.lstrip() for segment in segments])
+    elif format == "srt":
+        return write_srt(segments)
+    
+    return write_vtt(segments)
 
 
 def write_vtt(transcript):
@@ -116,10 +169,12 @@ def write_vtt(transcript):
     Write the transcript in VTT format.
     '''
     result = ""
+
     for segment in transcript:
-        result += f"{format_timestamp(segment['start'])} --> {format_timestamp(segment['end'])}\n"
-        result += f"{segment['text'].strip().replace('-->', '->')}\n"
+        result += f"{format_timestamp(segment.start)} --> {format_timestamp(segment.end)}\n"
+        result += f"{segment.text.strip().replace('-->', '->')}\n"
         result += "\n"
+
     return result
 
 
@@ -128,10 +183,12 @@ def write_srt(transcript):
     Write the transcript in SRT format.
     '''
     result = ""
+
     for i, segment in enumerate(transcript, start=1):
         result += f"{i}\n"
-        result += f"{format_timestamp(segment['start'], always_include_hours=True, decimal_marker=',')} --> "
-        result += f"{format_timestamp(segment['end'], always_include_hours=True, decimal_marker=',')}\n"
-        result += f"{segment['text'].strip().replace('-->', '->')}\n"
+        result += f"{format_timestamp(segment.start, always_include_hours=True, decimal_marker=',')} --> "
+        result += f"{format_timestamp(segment.end, always_include_hours=True, decimal_marker=',')}\n"
+        result += f"{segment.text.strip().replace('-->', '->')}\n"
         result += "\n"
+
     return result
